@@ -23,6 +23,7 @@ import edu.stanford.nlp.trees.Tree;
 import edu.stanford.nlp.trees.Treebank;
 import edu.stanford.nlp.util.CollectionUtils;
 import edu.stanford.nlp.util.Generics;
+import edu.stanford.nlp.util.HashIndex;
 import edu.stanford.nlp.util.Index;
 import edu.stanford.nlp.util.Pair;
 import edu.stanford.nlp.util.ReflectionLoading;
@@ -545,13 +546,23 @@ public class PerceptronModel extends BaseModel  {
              " training trees and failed to do anything useful on " + numReorderFail + " trees");
   }
 
-  private void trainModel(String serializedPath, Tagger tagger, Random random, List<TrainingExample> trainingData, Treebank devTreebank, int nThreads, Set<String> allowedFeatures) {
+  /**
+   * Currently, the only thing returned is a counter with the first
+   * errors at the best training iteration.  The idea is that this
+   * information can be used after partially training a model to
+   * figure out some new transitions to add to make the next version
+   * of the model better.
+   */
+  private IntCounter<Pair<Integer, Integer>> trainModel(String serializedPath, Tagger tagger, Random random, List<TrainingExample> trainingData, Treebank devTreebank, int nThreads, Set<String> allowedFeatures, int numIterations) {
     double bestScore = 0.0;
     int bestIteration = 0;
+
     PriorityQueue<ScoredObject<PerceptronModel>> bestModels = null;
     if (op.trainOptions().averagedModels > 0) {
       bestModels = new PriorityQueue<>(op.trainOptions().averagedModels + 1, ScoredComparator.ASCENDING_COMPARATOR);
     }
+
+    IntCounter<Pair<Integer, Integer>> bestFirstErrors = null;
 
     MulticoreWrapper<TrainingExample, TrainingResult> wrapper = null;
     if (nThreads != 1) {
@@ -568,7 +579,7 @@ public class PerceptronModel extends BaseModel  {
       featureFrequencies = new IntCounter<>();
     }
 
-    for (int iteration = 1; iteration <= op.trainOptions.trainingIterations; ++iteration) {
+    for (int iteration = 1; iteration <= numIterations; ++iteration) {
       Timing trainingTimer = new Timing();
       int numCorrect = 0;
       int numWrong = 0;
@@ -646,6 +657,7 @@ public class PerceptronModel extends BaseModel  {
           log.info("New best dev score (previous best " + bestScore + ")");
           bestScore = labelF1;
           bestIteration = iteration;
+          bestFirstErrors = firstErrors;
         } else {
           log.info("Failed to improve for " + (iteration - bestIteration) + " iteration(s) on previous best score of " + bestScore);
           if (op.trainOptions.stalledIterationLimit > 0 && (iteration - bestIteration >= op.trainOptions.stalledIterationLimit)) {
@@ -714,6 +726,8 @@ public class PerceptronModel extends BaseModel  {
     }
 
     condenseFeatures();
+
+    return bestFirstErrors;
   }
 
   /**
@@ -735,6 +749,17 @@ public class PerceptronModel extends BaseModel  {
       }
     }
     return prunedFeatures;
+  }
+
+  static Index<Transition> chooseExtraTransitions(PerceptronModel initialModel,
+                                                  Tagger tagger,
+                                                  Random random,
+                                                  List<TrainingExample> trainingData,
+                                                  Treebank devTreebank,
+                                                  int nThreads) {
+    PerceptronModel tempModel = new PerceptronModel(initialModel);
+    IntCounter<Pair<Integer, Integer>> firstErrors = tempModel.trainModel(null, tagger, random, trainingData, devTreebank, nThreads, null, 20);
+    return new HashIndex<>();
   }
 
   /**
@@ -772,13 +797,21 @@ public class PerceptronModel extends BaseModel  {
                                            int nThreads) {
     if (initialModel == null) {
       initialModel = new PerceptronModel(op, transitionIndex, knownStates, rootStates, rootOnlyStates);
+    } else if (op.trainOptions().learnExtraTransitions) {
+      throw new IllegalArgumentException("Have not yet implemented learning extra transitions starting from an already trained model");
+    } else if (!op.trainOptions().learnExtraTransitions && initialModel.op.trainOptions().learnExtraTransitions) {
+      throw new IllegalArgumentException("Already trained model had extra transitions");
+    }
+
+    if (op.trainOptions().learnExtraTransitions) {
+      Index<Transition> extraTransitions = chooseExtraTransitions(initialModel, tagger, random, trainingData, devTreebank, nThreads);
     }
 
     if (op.trainOptions().retrainAfterCutoff && op.trainOptions().featureFrequencyCutoff > 0 ||
         op.trainOptions().retrainShards > 1) {
       String tempName = serializedPath.substring(0, serializedPath.length() - 7) + "-" + "temp.ser.gz";
       PerceptronModel currentModel = new PerceptronModel(initialModel);
-      currentModel.trainModel(tempName, tagger, random, trainingData, devTreebank, nThreads, null);
+      currentModel.trainModel(tempName, tagger, random, trainingData, devTreebank, nThreads, null, op.trainOptions().trainingIterations);
 
       if (op.trainOptions().saveIntermediateModels) {
         ShiftReduceParser temp = new ShiftReduceParser(op, currentModel);
@@ -790,7 +823,7 @@ public class PerceptronModel extends BaseModel  {
 
       currentModel = new PerceptronModel(initialModel);
       currentModel.filterFeatures(allowedFeatures);
-      currentModel.trainModel(serializedPath, tagger, random, trainingData, devTreebank, nThreads, allowedFeatures);
+      currentModel.trainModel(serializedPath, tagger, random, trainingData, devTreebank, nThreads, allowedFeatures, op.trainOptions().trainingIterations);
 
       // If we only had one train shard, we are now done.  Otherwise,
       // we retrain N-1 more times, each time dropping a fraction of
@@ -804,7 +837,7 @@ public class PerceptronModel extends BaseModel  {
           Set<String> prunedFeatures = pruneFeatures(allowedFeatures, random, op.trainOptions().retrainShardFeatureDrop);
           currentModel = new PerceptronModel(initialModel);
           currentModel.filterFeatures(prunedFeatures);
-          currentModel.trainModel(serializedPath, tagger, random, trainingData, devTreebank, nThreads, prunedFeatures);
+          currentModel.trainModel(serializedPath, tagger, random, trainingData, devTreebank, nThreads, prunedFeatures, op.trainOptions().trainingIterations);
           shards.add(currentModel);
         }
         log.info("Averaging " + op.trainOptions().retrainShards + " shards");
@@ -817,7 +850,7 @@ public class PerceptronModel extends BaseModel  {
       return currentModel;
     } else {
       PerceptronModel currentModel = new PerceptronModel(initialModel);
-      currentModel.trainModel(serializedPath, tagger, random, trainingData, devTreebank, nThreads, null);
+      currentModel.trainModel(serializedPath, tagger, random, trainingData, devTreebank, nThreads, null, op.trainOptions().trainingIterations);
       return currentModel;
     }
   }
